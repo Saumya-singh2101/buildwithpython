@@ -1,169 +1,198 @@
-import React, { useEffect, useState, useRef } from "react";
+/**
+ * LiveMap — Free satellite-style map (Esri World Imagery + labels) + Leaflet
+ * No API key required. Sleek, minimal vehicle markers — Uber/Ola style, not cartoonish.
+ *
+ * Usage:
+ *   <LiveMap vehicles={vehicles} center={[19.0760, 72.8777]} zoom={12} height={420} />
+ *
+ * `vehicles` shape (flexible, matches your Supabase rows):
+ *   { id, lat, lng, mode: "bus"|"metro"|"train", routes: { name, mode, color }, delay_minutes, crowd_level, heading }
+ */
+import React, { useEffect, useMemo } from "react";
 import { MapContainer, TileLayer, Marker, Popup, Polyline, useMap } from "react-leaflet";
 import L from "leaflet";
 import "leaflet/dist/leaflet.css";
-import { getLiveTransit, createLiveSocket } from "../utils/api";
-import markerIcon2x from "leaflet/dist/images/marker-icon-2x.png";
-import markerIcon   from "leaflet/dist/images/marker-icon.png";
-import markerShadow from "leaflet/dist/images/marker-shadow.png";
 
-delete L.Icon.Default.prototype._getIconUrl;
-L.Icon.Default.mergeOptions({ iconRetinaUrl: markerIcon2x, iconUrl: markerIcon, shadowUrl: markerShadow });
+const MODE_COLOR = { bus: "#f97316", metro: "#a855f7", train: "#14b8a6" };
+const MODE_LABEL = { bus: "BUS", metro: "METRO", train: "TRAIN" };
 
-const MODE_COLORS = { bus: "#dc2626", metro: "#f97316", train: "#7c3aed" };
-const MODE_LABELS = { bus: "🚌", metro: "🚇", train: "🚆" };
-const CROWD_COLORS = { low: "#22c55e", medium: "#f59e0b", high: "#ef4444" };
+const DEFAULT_CENTER = [19.0760, 72.8777]; // Mumbai
 
-const vehicleIcon = (mode, delay) => {
-  const color = MODE_COLORS[mode] || "#dc2626";
-  const emoji = MODE_LABELS[mode] || "🚌";
-  const ring  = delay > 0 ? "#ef4444" : "#22c55e";
+/* Sleek directional marker — a soft rounded chevron/dot, not an emoji-in-circle.
+   Rotates to `heading` if provided, otherwise sits as a clean glowing dot. */
+function buildIcon(mode, delayed, heading) {
+  const color = MODE_COLOR[mode] || "#14b8a6";
+  const hasHeading = typeof heading === "number";
+
+  const html = hasHeading
+    ? `
+      <div style="
+        width:22px;height:22px;
+        transform:rotate(${heading}deg);
+        filter:drop-shadow(0 1px 3px rgba(0,0,0,0.5));
+      ">
+        <svg width="22" height="22" viewBox="0 0 22 22">
+          <circle cx="11" cy="11" r="9" fill="${color}" opacity="0.18"/>
+          <path d="M11 2 L17 16 L11 13 L5 16 Z" fill="${color}" stroke="rgba(13,27,42,0.9)" stroke-width="1"/>
+        </svg>
+        ${delayed ? `<div style="position:absolute;top:-2px;right:-2px;width:7px;height:7px;border-radius:50%;background:#ef4444;border:1.5px solid #0d1b2a;"></div>` : ""}
+      </div>
+    `
+    : `
+      <div style="position:relative;width:20px;height:20px;filter:drop-shadow(0 1px 3px rgba(0,0,0,0.5));">
+        <div style="
+          position:absolute;inset:0;border-radius:50%;
+          background:${color};opacity:0.16;
+          transform:scale(1.8);
+        "></div>
+        <div style="
+          position:absolute;inset:0;margin:auto;width:11px;height:11px;top:4.5px;left:4.5px;
+          border-radius:50%;background:${color};
+          border:1.5px solid rgba(13,27,42,0.85);
+        "></div>
+        ${delayed ? `<div style="position:absolute;top:-1px;right:-1px;width:6px;height:6px;border-radius:50%;background:#ef4444;border:1px solid #0d1b2a;"></div>` : ""}
+      </div>
+    `;
+
   return L.divIcon({
-    className: "",
-    html: `<div style="position:relative;width:38px;height:38px">
-      <div style="position:absolute;inset:0;border-radius:50%;border:2px solid ${ring};background:${color}18;animation:pulse-ring 1.8s ease-in-out infinite;"></div>
-      <div style="position:absolute;inset:5px;border-radius:50%;background:#0f0f0f;border:1.5px solid ${color};display:flex;align-items:center;justify-content:center;font-size:13px;">${emoji}</div>
-    </div>`,
-    iconSize: [38, 38],
-    iconAnchor: [19, 19],
+    className: "safar-vehicle-marker",
+    html,
+    iconSize: [22, 22],
+    iconAnchor: [11, 11],
+    popupAnchor: [0, -12],
   });
-};
+}
 
-function MapController({ center }) {
+/* Smoothly re-center map when center prop changes (e.g. user picks a new origin) */
+function RecenterOnChange({ center, zoom }) {
   const map = useMap();
-  useEffect(() => { if (center) map.flyTo(center, 14, { duration: 1.2 }); }, [center, map]);
+  useEffect(() => {
+    if (center) map.flyTo(center, zoom ?? map.getZoom(), { duration: 0.8 });
+  }, [center, zoom, map]);
   return null;
 }
 
-const MODE_TABS = [
-  { id: "all",   label: "All",   color: "#a1a1aa" },
-  { id: "bus",   label: "Bus",   color: "#dc2626" },
-  { id: "metro", label: "Metro", color: "#f97316" },
-  { id: "train", label: "Train", color: "#7c3aed" },
-];
+/* Esri World Imagery — real satellite photography, free, no API key.
+   Paired with a reference/labels overlay so street names + transit context are legible. */
+const SAT_TILE_URL = "https://server.arcgisonline.com/ArcGIS/rest/services/World_Imagery/MapServer/tile/{z}/{y}/{x}";
+const SAT_ATTR = "Tiles &copy; Esri — Source: Esri, Maxar, Earthstar Geographics, USGS, USDA";
 
-export default function LiveMap({ onVehicleSelect }) {
-  const [vehicles, setVehicles] = useState([]);
-  const [loading,  setLoading]  = useState(true);
-  const [selected, setSelected] = useState(null);
-  const [filter,   setFilter]   = useState("all");
-  const wsRef = useRef(null);
+const LABELS_TILE_URL = "https://server.arcgisonline.com/ArcGIS/rest/services/Reference/World_Boundaries_and_Places/MapServer/tile/{z}/{y}/{x}";
 
-  const MUMBAI = [19.076, 72.877];
+/* Subtle dark scrim over the satellite imagery so teal UI markers / popups stay legible
+   and the whole thing reads as a moody "ops console" map rather than a raw photo. */
+const SCRIM_STYLE = {
+  position: "absolute",
+  inset: 0,
+  background: "linear-gradient(180deg, rgba(13,27,42,0.35) 0%, rgba(13,27,42,0.15) 40%, rgba(13,27,42,0.45) 100%)",
+  pointerEvents: "none",
+  zIndex: 2,
+};
 
-  useEffect(() => {
-    getLiveTransit()
-      .then(d => { setVehicles(d.vehicles || []); setLoading(false); })
-      .catch(() => setLoading(false));
+export default function LiveMap({
+  vehicles = [],
+  center = DEFAULT_CENTER,
+  zoom = 12,
+  height = 420,
+  routeLine = null,      // optional [[lat,lng], [lat,lng], ...] to draw a planned route
+  highlightStops = [],   // optional [{lat, lng, name}] for origin/dest pins
+  borderRadius = 16,
+}) {
+  const icons = useMemo(() => {
+    const cache = {};
+    return (mode, delayed, heading) => {
+      const key = `${mode}-${delayed}-${heading ?? "n"}`;
+      if (!cache[key]) cache[key] = buildIcon(mode, delayed, heading);
+      return cache[key];
+    };
   }, []);
 
-  useEffect(() => {
-    wsRef.current = createLiveSocket((msg) => {
-      if (msg.type === "vehicle_positions") setVehicles(msg.vehicles || []);
-    });
-    return () => wsRef.current?.close();
-  }, []);
-
-  const filtered = vehicles.filter(v => filter === "all" || v.mode === filter);
-
-  const routeLines = {};
-  filtered.forEach(v => {
-    if (!v.routes?.stops || routeLines[v.route_id]) return;
-    try {
-      const stops = Array.isArray(v.routes.stops) ? v.routes.stops : JSON.parse(v.routes.stops);
-      routeLines[v.route_id] = { positions: stops.map(s => [s.lat, s.lng]), color: v.routes.color || MODE_COLORS[v.mode] };
-    } catch {}
-  });
+  const stopIcon = useMemo(
+    () =>
+      L.divIcon({
+        className: "safar-stop-marker",
+        html: `<div style="
+          width:13px;height:13px;border-radius:50%;
+          background:#f0fafa;border:2.5px solid #14b8a6;
+          box-shadow:0 0 6px rgba(20,184,166,0.7);
+        "></div>`,
+        iconSize: [13, 13],
+        iconAnchor: [6.5, 6.5],
+      }),
+    []
+  );
 
   return (
-    <div className="relative flex flex-col h-full min-h-[420px]">
-      {/* Filter tabs */}
-      <div className="flex items-center gap-2 mb-3">
-        {MODE_TABS.map(tab => (
-          <button
-            key={tab.id}
-            onClick={() => setFilter(tab.id)}
-            className="px-3 py-1.5 rounded-lg text-xs font-semibold transition-all duration-150"
-            style={
-              filter === tab.id
-                ? { background: `${tab.color}18`, color: tab.color, border: `1px solid ${tab.color}40` }
-                : { background: "#161616", color: "#52525b", border: "1px solid #262626" }
-            }
-          >
-            {tab.label}
-            {filter === tab.id && filtered.length > 0 && (
-              <span className="ml-1.5 opacity-70">{filtered.length}</span>
-            )}
-          </button>
-        ))}
+    <div style={{ height, width: "100%", borderRadius, overflow: "hidden", position: "relative" }}>
+      <MapContainer
+        center={center}
+        zoom={zoom}
+        style={{ height: "100%", width: "100%", background: "#0d1b2a" }}
+        zoomControl={true}
+        attributionControl={true}
+        scrollWheelZoom={true}
+      >
+        <TileLayer url={SAT_TILE_URL} attribution={SAT_ATTR} maxZoom={19} />
+        <TileLayer url={LABELS_TILE_URL} maxZoom={19} opacity={0.85} />
 
-        <div className="ml-auto flex items-center gap-1.5">
-          <span className="w-1.5 h-1.5 rounded-full bg-[#22c55e] animate-pulse-ring inline-block" />
-          <span className="text-xs text-[#52525b]">{filtered.length} live</span>
-        </div>
-      </div>
+        <RecenterOnChange center={center} zoom={zoom} />
 
-      {/* Map */}
-      <div className="flex-1 rounded-xl overflow-hidden border border-[#1f1f1f] relative" style={{ minHeight: 380 }}>
-        {loading ? (
-          <div className="absolute inset-0 bg-[#111111] flex flex-col items-center justify-center gap-3">
-            <div className="w-7 h-7 border-2 border-[#dc2626] border-t-transparent rounded-full animate-spin" />
-            <p className="text-xs text-[#52525b]">Loading live map…</p>
-          </div>
-        ) : (
-          <MapContainer center={MUMBAI} zoom={12} style={{ height: "100%", width: "100%" }} zoomControl={false}>
-            <TileLayer url="https://{s}.basemaps.cartocdn.com/dark_all/{z}/{x}/{y}{r}.png" />
-            <MapController center={selected} />
-
-            {Object.entries(routeLines).map(([id, { positions, color }]) => (
-              <Polyline key={id} positions={positions} color={color} weight={2} opacity={0.45} dashArray="6 4" />
-            ))}
-
-            {filtered.map(v => (
-              <Marker
-                key={v.id}
-                position={[v.lat, v.lng]}
-                icon={vehicleIcon(v.mode, v.delay_minutes)}
-                eventHandlers={{ click: () => { setSelected([v.lat, v.lng]); onVehicleSelect?.(v); } }}
-              >
-                <Popup>
-                  <div style={{ background: "#161616", borderRadius: 10, padding: "12px 14px", minWidth: 180, color: "#f0f0f0", fontSize: 13, border: "1px solid #262626" }}>
-                    <div style={{ fontWeight: 700, marginBottom: 8, color: "#fff", fontSize: 14 }}>
-                      {MODE_LABELS[v.mode]} {v.routes?.name || v.route_id}
-                    </div>
-                    <div style={{ display: "flex", flexDirection: "column", gap: 5 }}>
-                      <div style={{ color: "#71717a" }}>Next stop: <span style={{ color: "#fff" }}>{v.next_stop || "—"}</span></div>
-                      <div style={{ color: "#71717a" }}>Delay:&nbsp;
-                        <span style={{ color: v.delay_minutes > 0 ? "#ef4444" : "#22c55e", fontWeight: 600 }}>
-                          {v.delay_minutes > 0 ? `+${v.delay_minutes} min` : "On time"}
-                        </span>
-                      </div>
-                      <div style={{ color: "#71717a" }}>Crowd:&nbsp;
-                        <span style={{ color: CROWD_COLORS[v.crowd_level], fontWeight: 600, textTransform: "capitalize" }}>
-                          {v.crowd_level}
-                        </span>
-                      </div>
-                      {v.eta_prediction && (
-                        <div style={{ color: "#71717a" }}>ETA: <span style={{ color: "#fff" }}>{v.eta_prediction.eta} ({v.eta_prediction.minutes_away} min)</span></div>
-                      )}
-                    </div>
-                  </div>
-                </Popup>
-              </Marker>
-            ))}
-          </MapContainer>
+        {routeLine && routeLine.length > 1 && (
+          <Polyline
+            positions={routeLine}
+            pathOptions={{ color: "#14b8a6", weight: 3, opacity: 0.85, dashArray: "1,8", lineCap: "round" }}
+          />
         )}
 
-        {/* Legend overlay */}
-        <div className="absolute bottom-3 left-3 z-[1000] flex items-center gap-3 px-3 py-2 rounded-lg bg-[#111111]/90 border border-[#1f1f1f] backdrop-blur-sm">
-          {Object.entries(MODE_COLORS).map(([mode, color]) => (
-            <div key={mode} className="flex items-center gap-1.5">
-              <div className="w-2 h-2 rounded-full" style={{ background: color }} />
-              <span className="text-[11px] text-[#71717a] capitalize">{mode}</span>
-            </div>
-          ))}
-        </div>
-      </div>
+        {highlightStops.map((s, i) => (
+          <Marker key={`stop-${i}`} position={[s.lat, s.lng]} icon={stopIcon}>
+            <Popup>
+              <strong>{s.name}</strong>
+            </Popup>
+          </Marker>
+        ))}
+
+        {vehicles.map((v) => {
+          const lat = v.lat ?? v.latitude;
+          const lng = v.lng ?? v.longitude;
+          if (lat == null || lng == null) return null;
+          const mode = v.mode || v.routes?.mode || "bus";
+          const delayed = (v.delay_minutes ?? 0) > 5;
+          return (
+            <Marker
+              key={v.id || v.vehicle_id}
+              position={[lat, lng]}
+              icon={icons(mode, delayed, v.heading)}
+            >
+              <Popup>
+                <div style={{ fontSize: 12, lineHeight: 1.6, minWidth: 140 }}>
+                  <div style={{ fontWeight: 700, marginBottom: 2 }}>
+                    {v.routes?.name || v.route_name || "Route"}
+                  </div>
+                  <div style={{ color: "#666", fontSize: 11, letterSpacing: "0.04em" }}>
+                    {MODE_LABEL[mode]} · {v.vehicle_id || v.id}
+                  </div>
+                  <div style={{ marginTop: 4 }}>
+                    {v.delay_minutes > 0 ? (
+                      <span style={{ color: "#dc2626", fontWeight: 600 }}>+{v.delay_minutes} min delay</span>
+                    ) : (
+                      <span style={{ color: "#16a34a", fontWeight: 600 }}>On time</span>
+                    )}
+                  </div>
+                  {v.crowd_level && (
+                    <div style={{ color: "#666", fontSize: 11, marginTop: 2 }}>
+                      Crowd: {v.crowd_level}
+                    </div>
+                  )}
+                </div>
+              </Popup>
+            </Marker>
+          );
+        })}
+      </MapContainer>
+
+      {/* Cinematic dark scrim so the UI feels like a real-time ops console, not a raw satellite photo */}
+      <div style={SCRIM_STYLE} />
     </div>
   );
 }

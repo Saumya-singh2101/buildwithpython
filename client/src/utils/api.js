@@ -1,156 +1,145 @@
-import { supabase } from "./supabase";
+/**
+ * SAFAR — Frontend API client
+ * Talks to the real FastAPI backend (main.py) for everything: journey planning,
+ * live transit + ML predictions, stops, alerts, and network health.
+ * No client-side mock/random data, no duplicate logic — the backend is the
+ * single source of truth.
+ */
+
+const API = import.meta.env.VITE_API_URL || "http://localhost:8000";
+const WS_URL = API.replace(/^http/, "ws") + "/updates";
+
+async function handle(res) {
+  if (!res.ok) {
+    const body = await res.json().catch(() => ({}));
+    throw new Error(body.detail || `Request failed: ${res.status}`);
+  }
+  return res.json();
+}
+
+// ─────────────────────────────────────────
+// STOPS  (powers the From/To selectors — fully dynamic, no hardcoded list)
+// ─────────────────────────────────────────
+
+export async function getStops() {
+  const res = await fetch(`${API}/stops`);
+  return handle(res); // { stops: Stop[], count }
+}
 
 // ─────────────────────────────────────────
 // ALERTS
 // ─────────────────────────────────────────
 
-/**
- * Fetch all active alerts, newest first.
- * Returns { alerts: Alert[] }
- */
 export async function getAlerts() {
-  const { data, error } = await supabase
-    .from("alerts")
-    .select("*")
-    .eq("active", true)
-    .order("created_at", { ascending: false });
+  const res = await fetch(`${API}/alerts`);
+  const data = await handle(res);
+  return { alerts: data.alerts ?? [] };
+}
 
-  if (error) throw new Error(error.message);
-  return { alerts: data ?? [] };
+export async function broadcastAlert({ type, severity, title, message, route_ids = [] }) {
+  const res = await fetch(`${API}/alert`, {
+    method: "POST",
+    headers: { "Content-Type": "application/json" },
+    body: JSON.stringify({ type, severity, title, message, route_ids }),
+  });
+  return handle(res);
 }
 
 // ─────────────────────────────────────────
-// LIVE TRANSIT (map)
+// LIVE TRANSIT  (map) — includes real ML delay/eta/crowd predictions per vehicle
 // ─────────────────────────────────────────
 
-/**
- * Fetch all live vehicles joined with their route data (stops, name, color).
- * Returns { vehicles: Vehicle[] }
- */
 export async function getLiveTransit() {
-  const { data, error } = await supabase
-    .from("vehicles")
-    .select(`
-      *,
-      routes (
-        id,
-        name,
-        color,
-        stops
-      )
-    `);
-
-  if (error) throw new Error(error.message);
-
-  // Normalise stops: supabase returns jsonb as a parsed object already
-  const vehicles = (data ?? []).map((v) => ({
-    ...v,
-    routes: v.routes
-      ? {
-          ...v.routes,
-          stops:
-            typeof v.routes.stops === "string"
-              ? JSON.parse(v.routes.stops)
-              : v.routes.stops,
-        }
-      : null,
-  }));
-
-  return { vehicles };
+  const res = await fetch(`${API}/transit/live`);
+  const data = await handle(res);
+  return { vehicles: data.vehicles ?? [] };
 }
 
 /**
- * Open a WebSocket-style polling loop that mimics a live socket.
- * Supabase Realtime handles vehicles via postgres_changes, but the LiveMap
- * component expects a createLiveSocket(onMessage) interface that returns { close }.
+ * Opens the real backend WebSocket (/updates) for live vehicle position pushes
+ * every ~4s, straight from FastAPI — not a client-side polling loop.
+ * Falls back to short-interval polling only if the socket can't connect at all
+ * (e.g. dev environment without the WS route reachable), so the UI never goes
+ * fully dark, but the live path is always the real socket first.
  *
- * We poll vehicles every 10 s and emit { type: "vehicle_positions", vehicles }.
+ * Returns { close }.
  */
 export function createLiveSocket(onMessage) {
-  let active = true;
+  let socket = null;
+  let pollId = null;
+  let closed = false;
+  let reconnectAttempts = 0;
 
-  async function poll() {
-    if (!active) return;
+  function startPollingFallback() {
+    if (pollId || closed) return;
+    pollId = setInterval(async () => {
+      try {
+        const { vehicles } = await getLiveTransit();
+        onMessage({ type: "vehicle_positions", vehicles });
+      } catch {
+        // swallow — UI keeps last known state
+      }
+    }, 8000);
+  }
+
+  function connect() {
+    if (closed) return;
     try {
-      const { vehicles } = await getLiveTransit();
-      onMessage({ type: "vehicle_positions", vehicles });
+      socket = new WebSocket(WS_URL);
+
+      socket.onmessage = (evt) => {
+        try {
+          const msg = JSON.parse(evt.data);
+          onMessage(msg);
+        } catch {
+          // ignore malformed frame
+        }
+      };
+
+      socket.onopen = () => {
+        reconnectAttempts = 0;
+        if (pollId) { clearInterval(pollId); pollId = null; }
+      };
+
+      socket.onclose = () => {
+        if (closed) return;
+        reconnectAttempts += 1;
+        if (reconnectAttempts <= 5) {
+          setTimeout(connect, Math.min(1000 * reconnectAttempts, 5000));
+        } else {
+          startPollingFallback();
+        }
+      };
+
+      socket.onerror = () => {
+        socket?.close();
+      };
     } catch {
-      // swallow — LiveMap handles stale data gracefully
-    }
-    if (active) setTimeout(poll, 10_000);
-  }
-
-  poll();
-
-  return { close: () => { active = false; } };
-}
-
-// ─────────────────────────────────────────
-// JOURNEY PLANNER
-// ─────────────────────────────────────────
-
-/**
- * Haversine distance in km between two lat/lng points.
- */
-function haversine(lat1, lng1, lat2, lng2) {
-  const R = 6371;
-  const dLat = ((lat2 - lat1) * Math.PI) / 180;
-  const dLng = ((lng2 - lng1) * Math.PI) / 180;
-  const a =
-    Math.sin(dLat / 2) ** 2 +
-    Math.cos((lat1 * Math.PI) / 180) *
-      Math.cos((lat2 * Math.PI) / 180) *
-      Math.sin(dLng / 2) ** 2;
-  return R * 2 * Math.atan2(Math.sqrt(a), Math.sqrt(1 - a));
-}
-
-/**
- * Given all routes (with stops), find ones that serve both the origin area and
- * the destination area (within `thresholdKm`).
- */
-function matchRoutes(routes, originLat, originLng, destLat, destLng, thresholdKm = 3) {
-  const matches = [];
-
-  for (const route of routes) {
-    const stops = Array.isArray(route.stops)
-      ? route.stops
-      : JSON.parse(route.stops ?? "[]");
-
-    let boardStop = null;
-    let boardDist = Infinity;
-    let alightStop = null;
-    let alightDist = Infinity;
-
-    for (const stop of stops) {
-      const dOrigin = haversine(originLat, originLng, stop.lat, stop.lng);
-      const dDest   = haversine(destLat,   destLng,   stop.lat, stop.lng);
-
-      if (dOrigin < boardDist) { boardDist = dOrigin; boardStop = stop; }
-      if (dDest   < alightDist) { alightDist = dDest; alightStop = stop; }
-    }
-
-    // Must board before alighting (sequence check)
-    if (
-      boardStop &&
-      alightStop &&
-      boardStop.id !== alightStop.id &&
-      boardStop.sequence < alightStop.sequence &&
-      boardDist < thresholdKm &&
-      alightDist < thresholdKm
-    ) {
-      matches.push({ route, boardStop, alightStop, boardDist, alightDist });
+      startPollingFallback();
     }
   }
 
-  return matches;
+  connect();
+
+  return {
+    close: () => {
+      closed = true;
+      socket?.close();
+      if (pollId) clearInterval(pollId);
+    },
+  };
 }
+
+// ─────────────────────────────────────────
+// JOURNEY PLANNER — real ML-backed planning via FastAPI POST /journey/plan
+// ─────────────────────────────────────────
 
 /**
  * Plan a journey between two named lat/lng points.
- *
- * Fetches live routes + vehicles from Supabase, scores options by travel time,
- * blends in live delay data, and returns the same shape the JourneyPlanner
- * component expects.
+ * Delegates entirely to the backend's /journey/plan endpoint, which scores
+ * routes against live Supabase data, applies delay/crowd ML predictions,
+ * detects disruptions from active alerts, and auto-suggests a re-route
+ * alternate. No client-side route generation or randomization.
  *
  * @param {{ origin_name, origin_lat, origin_lng, dest_name, dest_lat, dest_lng, accessibility }} params
  */
@@ -163,122 +152,96 @@ export async function planJourney({
   dest_lng,
   accessibility = false,
 }) {
-  // 1. Load routes
-  const { data: routeRows, error: routeErr } = await supabase
-    .from("routes")
-    .select("*")
-    .eq("active", true);
-  if (routeErr) throw new Error(routeErr.message);
+  const res = await fetch(`${API}/journey/plan`, {
+    method: "POST",
+    headers: { "Content-Type": "application/json" },
+    body: JSON.stringify({
+      origin_name, origin_lat, origin_lng,
+      dest_name, dest_lat, dest_lng,
+      accessibility,
+    }),
+  });
+  return handle(res);
+  // → { origin, destination, distance_km, options, alternate, has_disruption, timestamp }
+}
 
-  // 2. Load live vehicles (for delay / crowd data)
-  const { data: vehicleRows, error: vehErr } = await supabase
-    .from("vehicles")
-    .select("*");
-  if (vehErr) throw new Error(vehErr.message);
+// ─────────────────────────────────────────
+// NETWORK HEALTH (operator + commuter sidebar)
+// ─────────────────────────────────────────
 
-  // 3. Load active alerts to detect disruptions
-  const { data: alertRows, error: alertErr } = await supabase
-    .from("alerts")
-    .select("*")
-    .eq("active", true);
-  if (alertErr) throw new Error(alertErr.message);
+export async function getNetworkStatus() {
+  const res = await fetch(`${API}/network/status`);
+  return handle(res); // { total_vehicles, delayed_vehicles, active_alerts, open_incidents, network_health }
+}
 
-  // Index vehicles by route_id for quick lookup
-  const vehiclesByRoute = {};
-  for (const v of vehicleRows ?? []) {
-    if (!vehiclesByRoute[v.route_id]) vehiclesByRoute[v.route_id] = [];
-    vehiclesByRoute[v.route_id].push(v);
-  }
+/** Per-route live status — replaces any hardcoded line list in the UI. */
+export async function getNetworkLines() {
+  const res = await fetch(`${API}/network/lines`);
+  return handle(res); // { lines: [{ id, name, mode, color, status }] }
+}
 
-  const disruptedRouteIds = new Set(
-    (alertRows ?? [])
-      .filter((a) => ["disruption", "cancellation"].includes(a.type))
-      .flatMap((a) => a.route_ids ?? [])
+// ─────────────────────────────────────────
+// ANALYTICS + FORECAST (operator dashboard)
+// ─────────────────────────────────────────
+
+export async function getAnalytics() {
+  const res = await fetch(`${API}/analytics`);
+  return handle(res);
+}
+
+export async function getForecast() {
+  const res = await fetch(`${API}/forecast`);
+  return handle(res);
+}
+
+// ─────────────────────────────────────────
+// INCIDENTS (operator dashboard)
+// ─────────────────────────────────────────
+
+export async function createIncident({ title, description, route_ids = [], severity = "medium" }) {
+  const res = await fetch(`${API}/incident`, {
+    method: "POST",
+    headers: { "Content-Type": "application/json" },
+    body: JSON.stringify({ title, description, route_ids, severity }),
+  });
+  return handle(res);
+}
+
+// ─────────────────────────────────────────
+// PER-VEHICLE ETA (used for a "track this vehicle" detail view, if added)
+// ─────────────────────────────────────────
+
+export async function getVehicleEta(vehicle_id) {
+  const res = await fetch(`${API}/eta?vehicle_id=${encodeURIComponent(vehicle_id)}`);
+  return handle(res);
+}
+
+// ─────────────────────────────────────────
+// ML SERVICES
+// ─────────────────────────────────────────
+
+export async function getMLDepartureAdvice({
+  origin_name,
+  dest_name,
+  target_eta_mins,
+  walk_to_station_mins,
+}) {
+  const res = await fetch(`${API}/forecast`);
+  return handle(res);
+}
+
+export async function getMLCrowdForecast({ route_id, date }) {
+  const res = await fetch(
+    `${API}/ml/crowd-forecast?route_id=${encodeURIComponent(route_id)}&date=${date}`
   );
 
-  // 4. Match routes to origin/dest
-  const totalDistKm = haversine(origin_lat, origin_lng, dest_lat, dest_lng);
-  const matches = matchRoutes(
-    routeRows ?? [],
-    origin_lat, origin_lng,
-    dest_lat,   dest_lng,
-    Math.max(3, totalDistKm * 0.6) // adaptive threshold
+  return handle(res);
+}
+
+export async function getWeather({ lat, lng }) {
+  const res = await fetch(
+    `${API}/weather?lat=${lat}&lng=${lng}`
   );
 
-  // 5. Build options
-  const SPEED_KMH = { bus: 18, metro: 35, train: 45 };
-  const now = new Date();
-
-  const options = matches.map((m, idx) => {
-    const vehicles = vehiclesByRoute[m.route.id] ?? [];
-    // Pick the vehicle closest to the board stop
-    const liveVehicle = vehicles.reduce((best, v) => {
-      const d = haversine(v.lat, v.lng, m.boardStop.lat, m.boardStop.lng);
-      return !best || d < best.dist ? { ...v, dist: d } : best;
-    }, null);
-
-    const delayMin    = liveVehicle?.delay_minutes ?? 0;
-    const crowdLevel  = liveVehicle?.crowd_level ?? "low";
-    const confidence  = Math.max(0.6, 1 - delayMin * 0.04);
-    const disrupted   = disruptedRouteIds.has(m.route.id);
-
-    const routeDistKm = haversine(
-      m.boardStop.lat, m.boardStop.lng,
-      m.alightStop.lat, m.alightStop.lng
-    );
-    const travelMin   = Math.round((routeDistKm / SPEED_KMH[m.route.mode]) * 60) + delayMin;
-
-    const eta = new Date(now.getTime() + travelMin * 60_000);
-    const etaStr = eta.toLocaleTimeString("en-IN", { hour: "2-digit", minute: "2-digit" });
-
-    return {
-      id:               m.route.id,
-      route_name:       m.route.name,
-      mode:             m.route.mode,
-      board_stop:       m.boardStop.name,
-      alight_stop:      m.alightStop.name,
-      walk_to_board_km: m.boardDist,
-      total_minutes:    travelMin,
-      eta:              etaStr,
-      delay_minutes:    delayMin,
-      crowd_level:      crowdLevel,
-      delay_confidence: confidence,
-      disrupted,
-    };
-  });
-
-  // 6. Sort: non-disrupted first, then by total_minutes
-  options.sort((a, b) => {
-    if (a.disrupted !== b.disrupted) return a.disrupted ? 1 : -1;
-    return a.total_minutes - b.total_minutes;
-  });
-
-  // 7. Separate best alternate when disruption present
-  const hasDisruption = options.some((o) => o.disrupted);
-  const mainOptions   = options.filter((o) => !o.disrupted);
-  const alternate     = hasDisruption ? options.find((o) => o.disrupted) ?? null : null;
-
-  // 8. Persist the journey (fire-and-forget)
-  supabase
-    .from("journeys")
-    .insert({
-      origin_name,
-      origin_lat,
-      origin_lng,
-      dest_name,
-      dest_lat,
-      dest_lng,
-      route_plan: { options: mainOptions, alternate },
-    })
-    .then(() => {})
-    .catch(() => {});
-
-  return {
-    origin:          origin_name,
-    destination:     dest_name,
-    distance_km:     totalDistKm.toFixed(1),
-    options:         mainOptions,
-    alternate,
-    has_disruption:  hasDisruption,
-  };
+  return handle(res);
 }

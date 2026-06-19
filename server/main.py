@@ -2,7 +2,7 @@
 SAFAR — FastAPI Backend
 Run: uvicorn main:app --reload --port 8000
 """
-
+from typing import List
 from fastapi import FastAPI, HTTPException, WebSocket, WebSocketDisconnect
 from fastapi.middleware.cors import CORSMiddleware
 from pydantic import BaseModel
@@ -15,7 +15,7 @@ from datetime import datetime, timedelta
 from supabase import create_client, Client
 import os
 from dotenv import load_dotenv
-
+from typing import List, Dict, Set, Tuple
 load_dotenv()
 
 SUPABASE_URL = os.getenv("SUPABASE_URL", "")
@@ -38,7 +38,7 @@ app.add_middleware(
 # ─────────────────────────────────────────
 class ConnectionManager:
     def __init__(self):
-        self.active: list[WebSocket] = []
+        self.active: List[WebSocket] = []
 
     async def connect(self, ws: WebSocket):
         await ws.accept()
@@ -139,6 +139,18 @@ async def get_alerts():
         raise HTTPException(500, str(e))
 
 
+@app.get("/stops")
+async def get_stops():
+    """All transit stops/stations — powers the From/To selectors on the frontend.
+    Fully dynamic: add/remove/edit rows in the Supabase `stops` table and the
+    journey planner UI updates automatically, no redeploy needed."""
+    try:
+        res = supabase.table("stops").select("*").order("name").execute()
+        return {"stops": res.data or [], "count": len(res.data or [])}
+    except Exception as e:
+        raise HTTPException(500, str(e))
+
+
 @app.get("/crowd")
 async def get_crowd(route_id: Optional[str] = None):
     """Crowd levels for all or a specific route."""
@@ -224,11 +236,26 @@ async def plan_journey(req: JourneyRequest):
             if best_origin[1] > 5 or best_dest[1] > 5:  # >5km away, skip
                 return None
             total_walk = best_origin[1] + best_dest[1]
+
+            # Build the ordered list of stops actually passed through on this leg,
+            # using each stop's `sequence` so direction-of-travel is respected
+            # even if the route's stops array isn't pre-sorted.
+            board_seq = best_origin[0].get("sequence", 0)
+            alight_seq = best_dest[0].get("sequence", 0)
+            lo, hi = min(board_seq, alight_seq), max(board_seq, alight_seq)
+            stops_between = sorted(
+                [s for s in stops if lo <= s.get("sequence", 0) <= hi],
+                key=lambda s: s.get("sequence", 0),
+            )
+            if board_seq > alight_seq:
+                stops_between = list(reversed(stops_between))
+
             return {
                 "route": route,
                 "board_stop": best_origin[0],
                 "alight_stop": best_dest[0],
                 "walk_km": round(total_walk, 2),
+                "stops_between": stops_between,
             }
 
         options = []
@@ -248,6 +275,25 @@ async def plan_journey(req: JourneyRequest):
             travel_min = max(5, round(direct_dist * 3))
             total_min  = travel_min + delay_pred["minutes"] + round(scored["walk_km"] * 12)
 
+            # Build a per-stop ETA timeline across the intermediate stops so the
+            # commuter can see exactly what's coming up, not just board/alight.
+            stops_between = scored["stops_between"]
+            n_legs = max(1, len(stops_between) - 1)
+            timeline = []
+            for i, s in enumerate(stops_between):
+                leg_progress = i / n_legs
+                eta_at_stop = datetime.now() + timedelta(
+                    minutes=round(scored["walk_km"] * 6) + travel_min * leg_progress + delay_pred["minutes"] * leg_progress
+                )
+                timeline.append({
+                    "name": s["name"],
+                    "lat": s["lat"],
+                    "lng": s["lng"],
+                    "eta": eta_at_stop.strftime("%H:%M"),
+                    "is_board": i == 0,
+                    "is_alight": i == len(stops_between) - 1,
+                })
+
             options.append({
                 "id":             route["id"],
                 "route_name":     route["name"],
@@ -265,6 +311,8 @@ async def plan_journey(req: JourneyRequest):
                 "eta":            (datetime.now() + timedelta(minutes=total_min)).strftime("%H:%M"),
                 "disrupted":      is_disrupted,
                 "recommended":    not is_disrupted,
+                "stop_count":     len(stops_between),
+                "stops_timeline": timeline,
             })
 
         options.sort(key=lambda x: (x["disrupted"], x["total_minutes"]))
@@ -317,12 +365,52 @@ async def network_status():
         raise HTTPException(500, str(e))
 
 
+@app.get("/network/lines")
+async def network_lines():
+    """Per-route live health — replaces any hardcoded line-status list on the frontend.
+    Derives status straight from real vehicle delays + active disruption/cancellation alerts,
+    so it always reflects the current state of your Supabase data, nothing static."""
+    try:
+        routes = supabase.table("routes").select("*").eq("active", True).execute().data or []
+        vehicles = supabase.table("vehicles").select("*").execute().data or []
+        alerts = supabase.table("alerts").select("*").eq("active", True).execute().data or []
+
+        disrupted_route_ids = set()
+        for a in alerts:
+            if a.get("type") in ["disruption", "cancellation"]:
+                disrupted_route_ids.update(a.get("route_ids", []))
+
+        delayed_route_ids = set()
+        for v in vehicles:
+            if v.get("delay_minutes", 0) > 3:
+                delayed_route_ids.add(v.get("route_id"))
+
+        lines = []
+        for r in routes:
+            if r["id"] in disrupted_route_ids:
+                status = "disruption"
+            elif r["id"] in delayed_route_ids:
+                status = "delay"
+            else:
+                status = "ok"
+            lines.append({
+                "id": r["id"],
+                "name": r["name"],
+                "mode": r["mode"],
+                "color": r.get("color", "#14b8a6"),
+                "status": status,
+            })
+        return {"lines": lines}
+    except Exception as e:
+        raise HTTPException(500, str(e))
+
+
 class AlertBroadcast(BaseModel):
     type: str
     severity: str
     title: str
     message: str
-    route_ids: list[str] = []
+    route_ids: List[str] = []
 
 
 @app.post("/alert")
@@ -342,7 +430,7 @@ async def broadcast_alert(alert: AlertBroadcast):
 class IncidentCreate(BaseModel):
     title: str
     description: Optional[str] = None
-    route_ids: list[str] = []
+    route_ids: List[str] = []
     severity: str = "medium"
 
 
